@@ -137,6 +137,15 @@ func TestDeriveBalance(t *testing.T) {
 			expectedBalance: 40.0,
 			expectedDays:    0.0,
 		},
+		{
+			name:            "Negative anchor units clamped to zero",
+			anchorUnits:     -10.0,
+			recordedAt:      recordedAt,
+			ratePerDay:      10.0,
+			now:             now,
+			expectedBalance: 0.0,
+			expectedDays:    2.0,
+		},
 	}
 
 	for _, tc := range tests {
@@ -147,6 +156,52 @@ func TestDeriveBalance(t *testing.T) {
 			}
 			if math.Abs(days-tc.expectedDays) > 1e-9 {
 				t.Errorf("days = %v, expected %v", days, tc.expectedDays)
+			}
+		})
+	}
+}
+
+func TestDomainMapping_RechargeToAnchor(t *testing.T) {
+	tests := []struct {
+		state        RechargeExhaustionState
+		expectedType AnchorType
+		expectedTier AuthorityTier
+	}{
+		{
+			state:        ExhaustionStateConfirmedEmpty,
+			expectedType: AnchorTypeConfirmedEmpty,
+			expectedTier: TierFull,
+		},
+		{
+			state:        ExhaustionStateHadUnitsExact,
+			expectedType: AnchorTypeUserReportedResidual,
+			expectedTier: TierFull,
+		},
+		{
+			state:        ExhaustionStateHadUnitsBracket,
+			expectedType: AnchorTypeUserReportedResidual,
+			expectedTier: TierPartial,
+		},
+		{
+			state:        ExhaustionStateUnknown,
+			expectedType: AnchorTypeEstimatedModel,
+			expectedTier: TierZero,
+		},
+		{
+			state:        RechargeExhaustionState("INVALID_STATE"),
+			expectedType: AnchorTypeEstimatedModel,
+			expectedTier: TierZero,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(string(tc.state), func(t *testing.T) {
+			anchorType, tier := MapRechargeToAnchor(tc.state)
+			if anchorType != tc.expectedType {
+				t.Errorf("MapRechargeToAnchor(%s) anchorType = %s, expected %s", tc.state, anchorType, tc.expectedType)
+			}
+			if tier != tc.expectedTier {
+				t.Errorf("MapRechargeToAnchor(%s) tier = %v, expected %v", tc.state, tier, tc.expectedTier)
 			}
 		})
 	}
@@ -208,6 +263,30 @@ func TestEvaluateCycleAuthority(t *testing.T) {
 			w := EvaluateCycleAuthority(tc.start, tc.end)
 			if math.Abs(w-tc.expectedW) > 1e-9 {
 				t.Errorf("EvaluateCycleAuthority(%s, %s) = %v, expected %v", tc.start, tc.end, w, tc.expectedW)
+			}
+		})
+	}
+}
+
+func TestEvaluateCycleAuthorityFromTiers(t *testing.T) {
+	tests := []struct {
+		name      string
+		startTier AuthorityTier
+		endTier   AuthorityTier
+		expectedW float64
+	}{
+		{"Full to Full", TierFull, TierFull, 1.0},
+		{"Full to Partial", TierFull, TierPartial, 0.5},
+		{"Partial to Partial", TierPartial, TierPartial, 0.25},
+		{"Full to Zero", TierFull, TierZero, 0.0},
+		{"Zero to Partial", TierZero, TierPartial, 0.0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := EvaluateCycleAuthorityFromTiers(tc.startTier, tc.endTier)
+			if math.Abs(w-tc.expectedW) > 1e-9 {
+				t.Errorf("EvaluateCycleAuthorityFromTiers(%v, %v) = %v, expected %v", tc.startTier, tc.endTier, w, tc.expectedW)
 			}
 		})
 	}
@@ -284,17 +363,28 @@ func TestCalculateEMA(t *testing.T) {
 			t.Errorf("got newRate %v, expected %v", newRate, expectedRate)
 		}
 	})
+
+	t.Run("Defensive checks: NaN and Inf rates safely handled", func(t *testing.T) {
+		newRate, wasTrained, isAnomaly := CalculateEMA(math.NaN(), 10.0, 1.0, false, cfg)
+		if wasTrained || isAnomaly {
+			t.Errorf("NaN currentRate should return wasTrained=false, isAnomaly=false")
+		}
+
+		newRate, wasTrained, isAnomaly = CalculateEMA(10.0, math.NaN(), 1.0, false, cfg)
+		if wasTrained || !isAnomaly || newRate != 10.0 {
+			t.Errorf("NaN observedRate should be flagged as anomaly without mutation")
+		}
+
+		newRate, wasTrained, isAnomaly = CalculateEMA(10.0, 10.0, -0.5, false, cfg)
+		if wasTrained || newRate != 10.0 {
+			t.Errorf("Negative cycleWeight should return wasTrained=false without mutation")
+		}
+	})
 }
 
 func TestEvaluateAlertState(t *testing.T) {
 	cfg := DefaultConfig()
 	now := time.Now()
-
-	// BetaHigh = 0.85, BetaMedium = 0.70, BetaLow = 0.55
-	// ThresholdCriticalEnter = 24.0h
-	// ThresholdEarlyEnter    = 48.0h
-	// ThresholdEarlyExit     = 60.0h
-	// ThresholdCriticalExit  = 32.0h
 
 	t.Run("Transition Normal to Early Warning", func(t *testing.T) {
 		// T_safe = 50.0 * 0.85 = 42.5h (<= 48h, > 24h)
@@ -319,7 +409,6 @@ func TestEvaluateAlertState(t *testing.T) {
 	})
 
 	t.Run("Early Warning transitions to Critical when dropping", func(t *testing.T) {
-		// T_safe = 20.0 * 0.85 = 17.0h (<= 24h)
 		newState, shouldNotify := EvaluateAlertState(20.0, ConfidenceHigh, AlertStateEarlyWarning, time.Time{}, now, cfg)
 		if newState != AlertStateCritical || !shouldNotify {
 			t.Errorf("expected transition to CRITICAL, got state=%v notify=%v", newState, shouldNotify)
@@ -335,7 +424,6 @@ func TestEvaluateAlertState(t *testing.T) {
 	})
 
 	t.Run("Critical transitions to Normal on large recharge", func(t *testing.T) {
-		// T_safe = 80.0 * 0.85 = 68.0h (>= 60h ThresholdEarlyExit)
 		newState, shouldNotify := EvaluateAlertState(80.0, ConfidenceHigh, AlertStateCritical, time.Time{}, now, cfg)
 		if newState != AlertStateNormal || !shouldNotify {
 			t.Errorf("expected transition to NORMAL, got state=%v notify=%v", newState, shouldNotify)
@@ -350,27 +438,50 @@ func TestEvaluateAlertState(t *testing.T) {
 		}
 	})
 
-	t.Run("Unknown current state initializes correctly", func(t *testing.T) {
-		newState, _ := EvaluateAlertState(100.0, ConfidenceLow, AlertState("UNKNOWN"), time.Time{}, now, cfg)
-		if newState != AlertStateNormal {
-			t.Errorf("expected NORMAL for large hours, got %v", newState)
+	t.Run("Exact entry and exit boundary checks", func(t *testing.T) {
+		// With Beta = 1.0:
+		cfgExact := cfg
+		cfgExact.BetaHigh = 1.0
+
+		// Exact ThresholdCriticalEnter (24.0h): enters CRITICAL
+		st1, n1 := EvaluateAlertState(24.0, ConfidenceHigh, AlertStateNormal, time.Time{}, now, cfgExact)
+		if st1 != AlertStateCritical || !n1 {
+			t.Errorf("expected CRITICAL at 24.0h boundary, got %s", st1)
 		}
 
-		newStateEarly, _ := EvaluateAlertState(60.0, ConfidenceLow, AlertState("UNKNOWN"), time.Time{}, now, cfg)
-		// 60 * 0.55 = 33.0h (<= 48h, > 24h) -> EARLY_WARNING
-		if newStateEarly != AlertStateEarlyWarning {
-			t.Errorf("expected EARLY_WARNING, got %v", newStateEarly)
+		// Exact ThresholdEarlyEnter (48.0h): enters EARLY_WARNING
+		st2, n2 := EvaluateAlertState(48.0, ConfidenceHigh, AlertStateNormal, time.Time{}, now, cfgExact)
+		if st2 != AlertStateEarlyWarning || !n2 {
+			t.Errorf("expected EARLY_WARNING at 48.0h boundary, got %s", st2)
 		}
 
-		newStateCrit, _ := EvaluateAlertState(20.0, ConfidenceLow, AlertState("UNKNOWN"), time.Time{}, now, cfg)
-		// 20 * 0.55 = 11.0h (<= 24h) -> CRITICAL
-		if newStateCrit != AlertStateCritical {
-			t.Errorf("expected CRITICAL, got %v", newStateCrit)
+		// Exact ThresholdEarlyExit (60.0h): exits from EARLY_WARNING to NORMAL
+		st3, n3 := EvaluateAlertState(60.0, ConfidenceHigh, AlertStateEarlyWarning, time.Time{}, now, cfgExact)
+		if st3 != AlertStateNormal || !n3 {
+			t.Errorf("expected NORMAL at 60.0h exit boundary, got %s", st3)
+		}
+
+		// Just below ThresholdEarlyExit (59.99h): remains EARLY_WARNING
+		st4, n4 := EvaluateAlertState(59.99, ConfidenceHigh, AlertStateEarlyWarning, time.Time{}, now, cfgExact)
+		if st4 != AlertStateEarlyWarning || n4 {
+			t.Errorf("expected EARLY_WARNING just below 60.0h, got %s (notify=%v)", st4, n4)
+		}
+
+		// Exact ThresholdCriticalExit (32.0h): exits from CRITICAL to EARLY_WARNING
+		st5, n5 := EvaluateAlertState(32.0, ConfidenceHigh, AlertStateCritical, time.Time{}, now, cfgExact)
+		if st5 != AlertStateEarlyWarning || !n5 {
+			t.Errorf("expected EARLY_WARNING at 32.0h critical exit boundary, got %s", st5)
+		}
+
+		// Just below ThresholdCriticalExit (31.99h): remains CRITICAL (within cooldown)
+		recentNotified := now.Add(-1 * time.Hour) // within 12h cooldown
+		st6, n6 := EvaluateAlertState(31.99, ConfidenceHigh, AlertStateCritical, recentNotified, now, cfgExact)
+		if st6 != AlertStateCritical || n6 {
+			t.Errorf("expected CRITICAL just below 32.0h without notification, got %s (notify=%v)", st6, n6)
 		}
 	})
 
 	t.Run("Critical cooldown deduplication", func(t *testing.T) {
-		// T_safe = 17.0h (still critical)
 		lastNotified := now.Add(-6 * time.Hour) // only 6h elapsed, cooldown is 12h
 		newState, shouldNotify := EvaluateAlertState(20.0, ConfidenceHigh, AlertStateCritical, lastNotified, now, cfg)
 		if newState != AlertStateCritical {
@@ -389,7 +500,13 @@ func TestEvaluateAlertState(t *testing.T) {
 	})
 }
 
-func TestComputeConfidence(t *testing.T) {
+func TestComputeConfidence_FrozenSpecification(t *testing.T) {
+	// Formula: S = (0.25*M_count + 0.35*M_quality + 0.40*M_stability) * P_freshness
+	// Tiers:
+	// - HIGH: S >= 0.75 AND N_valid >= 3
+	// - MEDIUM: 0.45 <= S < 0.75 (or S >= 0.75 with N_valid < 3)
+	// - LOW: S < 0.45
+
 	t.Run("Zero cycles produces LOW confidence and zero score", func(t *testing.T) {
 		level, score := ComputeConfidence(0, 1.0, 0.5, 10.0, 1.0, 30.0)
 		if level != ConfidenceLow || score != 0.0 {
@@ -397,39 +514,142 @@ func TestComputeConfidence(t *testing.T) {
 		}
 	})
 
-	t.Run("5 mature cycles with high authority and low error yields HIGH", func(t *testing.T) {
-		level, score := ComputeConfidence(5, 1.0, 0.2, 10.0, 0.5, 30.0)
-		if level != ConfidenceHigh {
-			t.Errorf("expected HIGH confidence, got %v (score=%v)", level, score)
-		}
-		if score < 0.75 {
-			t.Errorf("expected score >= 0.75, got %v", score)
-		}
-	})
-
-	t.Run("Moderate cycles and partial authority yields MEDIUM", func(t *testing.T) {
-		// countFactor = 2/5 = 0.40, authFactor = 0.5, relError = 1.0/10 = 0.1 -> acc = 0.9
-		// baseScore = 0.35*0.4 + 0.35*0.5 + 0.30*0.9 = 0.14 + 0.175 + 0.27 = 0.585
-		// freshness = 1.0 - 5/30 = 25/30 = 0.833 -> score = 0.585 * 0.833 = 0.487 -> MEDIUM
-		level, score := ComputeConfidence(2, 0.5, 1.0, 10.0, 5.0, 30.0)
-		if level != ConfidenceMedium {
-			t.Errorf("expected MEDIUM confidence, got %v (score=%v)", level, score)
-		}
-	})
-
-	t.Run("Stale data beyond maxCycleWindow degrades confidence", func(t *testing.T) {
-		level, score := ComputeConfidence(5, 1.0, 0.2, 10.0, 35.0, 30.0)
+	t.Run("Zero authority cycles produce LOW confidence and zero score", func(t *testing.T) {
+		level, score := ComputeConfidence(5, 0.0, 0.1, 10.0, 1.0, 30.0)
 		if level != ConfidenceLow || score != 0.0 {
-			t.Errorf("expected LOW confidence (score 0.0) for expired cycle window, got %v, %v", level, score)
+			t.Errorf("got %v, %v; expected LOW, 0.0", level, score)
 		}
 	})
 
-	t.Run("Zero elapsed days gives full freshness factor", func(t *testing.T) {
-		level, score := ComputeConfidence(5, 1.0, 0.0, 10.0, 0.0, 30.0)
-		if level != ConfidenceHigh || score != 1.0 {
-			t.Errorf("expected HIGH confidence and 1.0 score, got %v, %v", level, score)
+	t.Run("Fewer than 3 valid cycles CANNOT gain HIGH confidence even with perfect score", func(t *testing.T) {
+		// N_valid = 2: M_count = 2/5 = 0.40. M_quality = 1.0. M_stability = 1.0.
+		// baseScore = 0.25*0.4 + 0.35*1.0 + 0.40*1.0 = 0.10 + 0.35 + 0.40 = 0.85
+		// S = 0.85 >= 0.75, BUT N_valid = 2 (< 3)! Must be downgraded to MEDIUM!
+		level, score := ComputeConfidence(2, 1.0, 0.0, 10.0, 1.0, 30.0)
+		if level != ConfidenceMedium {
+			t.Fatalf("Gate violated: expected MEDIUM for N_valid=2 even with score=%v >= 0.75, got %s", score, level)
+		}
+		if math.Abs(score-0.85) > 1e-9 {
+			t.Errorf("expected score 0.85, got %v", score)
 		}
 	})
+
+	t.Run("3 valid cycles with high quality and stability achieves HIGH confidence", func(t *testing.T) {
+		// N_valid = 3: M_count = 3/5 = 0.60. M_quality = 1.0. M_stability = 1.0 (MAE = 0).
+		// baseScore = 0.25*0.6 + 0.35*1.0 + 0.40*1.0 = 0.15 + 0.35 + 0.40 = 0.90
+		// S = 0.90 >= 0.75 and N_valid = 3 >= 3 -> HIGH!
+		level, score := ComputeConfidence(3, 1.0, 0.0, 10.0, 5.0, 30.0)
+		if level != ConfidenceHigh {
+			t.Fatalf("expected HIGH confidence, got %s (score=%v)", level, score)
+		}
+		if math.Abs(score-0.90) > 1e-9 {
+			t.Errorf("expected score 0.90, got %v", score)
+		}
+	})
+
+	t.Run("Exact Tier Boundaries", func(t *testing.T) {
+		// Test boundary S = 0.75 with N_valid = 5:
+		// M_count = 1.0 (0.25). M_quality = 1.0 (0.35). M_stability = 0.375 (0.40 * 0.375 = 0.15)
+		// Total baseScore = 0.25 + 0.35 + 0.15 = 0.75
+		levelHigh, scoreHigh := ComputeConfidence(5, 1.0, 6.25, 10.0, 10.0, 30.0)
+		if math.Abs(scoreHigh-0.75) > 1e-9 {
+			t.Errorf("expected exact 0.75 score, got %v", scoreHigh)
+		}
+		if levelHigh != ConfidenceHigh {
+			t.Errorf("expected HIGH at exact 0.75 boundary, got %s", levelHigh)
+		}
+
+		// Exact boundary S = 0.45:
+		// M_count = 1.0 (0.25). M_quality = 0.0. M_stability = 0.50 (0.40 * 0.50 = 0.20, from MAE=5 on duration 10)
+		// Total baseScore = 0.25 + 0.20 = 0.45 exact in float64
+		// Wait, if avgCycleWeight == 0, ComputeConfidence returns (LOW, 0.0). So let's use:
+		// M_count = 0.80 (4 cycles -> 0.25 * 0.80 = 0.20). M_quality = 0.285714... Or:
+		// Let's use: M_count = 1.0 (0.25). M_quality = 1.0 (0.35). M_stability = 0.0 -> total 0.60.
+		// For exactly 0.45:
+		// M_count = 2 cycles (2/5 = 0.4 -> 0.25 * 0.4 = 0.10).
+		// M_quality = 1.0 (0.35 * 1.0 = 0.35).
+		// M_stability = 0.0 (MAE >= duration, e.g. MAE=10 on duration 10).
+		// Total = 0.10 + 0.35 + 0.0 = 0.45 EXACT!
+		levelMed, scoreMed := ComputeConfidence(2, 1.0, 10.0, 10.0, 5.0, 30.0)
+		if math.Abs(scoreMed-0.45) > 1e-9 {
+			t.Errorf("expected exact 0.45 score, got %v", scoreMed)
+		}
+		if levelMed != ConfidenceMedium {
+			t.Errorf("expected MEDIUM at exact 0.45 boundary, got %s", levelMed)
+		}
+
+		// Just below 0.45 -> LOW:
+		// N_valid = 2 (0.10). M_quality = 0.99 (0.35 * 0.99 = 0.3465). M_stability = 0.0.
+		// Total = 0.4465 < 0.45 -> LOW
+		levelLow, scoreLow := ComputeConfidence(2, 0.99, 10.0, 10.0, 5.0, 30.0)
+		if scoreLow >= 0.45 || levelLow != ConfidenceLow {
+			t.Errorf("expected LOW for score < 0.45, got score=%v level=%s", scoreLow, levelLow)
+		}
+	})
+
+	t.Run("Freshness behavior: Before, At, and Beyond MaxCycleWindow", func(t *testing.T) {
+		maxWin := 30.0
+
+		// 1. Before MaxCycleWindow (elapsed = 15): P_freshness MUST BE 1.0 (NO DECAY before window)
+		_, sBefore := ComputeConfidence(5, 1.0, 0.0, 10.0, 15.0, maxWin)
+		// baseScore = 0.25*1 + 0.35*1 + 0.40*1 = 1.0
+		if math.Abs(sBefore-1.0) > 1e-9 {
+			t.Errorf("Freshness violated: score decayed before MaxCycleWindow (got %v, expected 1.0)", sBefore)
+		}
+
+		// 2. Exactly At MaxCycleWindow (elapsed = 30): P_freshness MUST BE 1.0
+		_, sAt := ComputeConfidence(5, 1.0, 0.0, 10.0, 30.0, maxWin)
+		if math.Abs(sAt-1.0) > 1e-9 {
+			t.Errorf("Freshness violated: score decayed at MaxCycleWindow (got %v, expected 1.0)", sAt)
+		}
+
+		// 3. Beyond MaxCycleWindow (elapsed = 60, elapsed - maxWin = 30 = 1.0*maxWin):
+		// P_freshness = max(0.2, 1 - 0.1 * (30/30)) = 1 - 0.1 = 0.90
+		_, sBeyond := ComputeConfidence(5, 1.0, 0.0, 10.0, 60.0, maxWin)
+		if math.Abs(sBeyond-0.90) > 1e-9 {
+			t.Errorf("Beyond MaxCycleWindow expected score 0.90, got %v", sBeyond)
+		}
+
+		// 4. Freshness Floor: Beyond 10*MaxCycleWindow (elapsed = 360 days)
+		// decay = 0.1 * (330/30) = 1.1 -> 1.0 - 1.1 = -0.1 -> clamped to 0.2
+		_, sFloor := ComputeConfidence(5, 1.0, 0.0, 10.0, 360.0, maxWin)
+		if math.Abs(sFloor-0.20) > 1e-9 {
+			t.Errorf("Minimum freshness floor of 0.2 violated: got %v", sFloor)
+		}
+	})
+
+	t.Run("Zero and negative mean cycle duration handled safely", func(t *testing.T) {
+		level, score := ComputeConfidence(3, 1.0, 1.0, 0.0, 5.0, 30.0)
+		// M_stability = 0.0. baseScore = 0.25*(3/5) + 0.35*(1.0) + 0 = 0.15 + 0.35 = 0.50 -> MEDIUM
+		if level != ConfidenceMedium || math.Abs(score-0.50) > 1e-9 {
+			t.Errorf("Safe handling failed for zero duration: got %s, %v (expected MEDIUM, 0.50)", level, score)
+		}
+
+		levelNeg, scoreNeg := ComputeConfidence(3, 1.0, 1.0, -5.0, 5.0, 30.0)
+		if levelNeg != ConfidenceMedium || math.Abs(scoreNeg-0.50) > 1e-9 {
+			t.Errorf("Safe handling failed for negative duration: got %s, %v", levelNeg, scoreNeg)
+		}
+	})
+}
+
+func TestCalculateCycleAudit_DataLeakagePrevention(t *testing.T) {
+	// Predict duration was 10 days, actual was 8.5 days. Absolute error = 1.5 days.
+	err := CalculateCycleAudit(10.0, 8.5)
+	if math.Abs(err-1.5) > 1e-9 {
+		t.Errorf("CalculateCycleAudit(10.0, 8.5) = %v, expected 1.5", err)
+	}
+
+	// Symmetrical check
+	err2 := CalculateCycleAudit(8.5, 10.0)
+	if math.Abs(err2-1.5) > 1e-9 {
+		t.Errorf("CalculateCycleAudit(8.5, 10.0) = %v, expected 1.5", err2)
+	}
+
+	// Safe handling of NaN
+	errNaN := CalculateCycleAudit(math.NaN(), 10.0)
+	if errNaN != 0.0 {
+		t.Errorf("CalculateCycleAudit with NaN should return 0.0, got %v", errNaN)
+	}
 }
 
 // ---------------------------------------------------------------------

@@ -62,17 +62,38 @@ type ProfileInput struct {
 	HasWashingMachine bool
 }
 
-// AnchorType represents the provenance and authority tier of a balance reading.
+// AnchorType represents the persisted balance_anchors.anchor_type values in the PostgreSQL schema.
 type AnchorType string
 
 const (
 	AnchorTypeVerifiedMeterReading AnchorType = "VERIFIED_METER_READING"
 	AnchorTypeConfirmedEmpty       AnchorType = "CONFIRMED_EMPTY"
-	AnchorTypeHadUnitsExact        AnchorType = "HAD_UNITS_EXACT"
-	AnchorTypeHadUnitsBracket      AnchorType = "HAD_UNITS_BRACKET"
 	AnchorTypeUserReportedResidual AnchorType = "USER_REPORTED_RESIDUAL"
 	AnchorTypeEstimatedModel       AnchorType = "ESTIMATED_MODEL"
-	AnchorTypeUnknown              AnchorType = "UNKNOWN"
+
+	// Aliases maintained for evaluation context compatibility
+	AnchorTypeHadUnitsExact   AnchorType = "HAD_UNITS_EXACT"
+	AnchorTypeHadUnitsBracket AnchorType = "HAD_UNITS_BRACKET"
+	AnchorTypeUnknown         AnchorType = "UNKNOWN"
+)
+
+// RechargeExhaustionState represents the persisted recharges.exhaustion_state values in the PostgreSQL schema.
+type RechargeExhaustionState string
+
+const (
+	ExhaustionStateConfirmedEmpty  RechargeExhaustionState = "CONFIRMED_EMPTY"
+	ExhaustionStateHadUnitsExact   RechargeExhaustionState = "HAD_UNITS_EXACT"
+	ExhaustionStateHadUnitsBracket RechargeExhaustionState = "HAD_UNITS_BRACKET"
+	ExhaustionStateUnknown         RechargeExhaustionState = "UNKNOWN"
+)
+
+// AuthorityTier represents the epistemic authority tier for cycle calibration.
+type AuthorityTier float64
+
+const (
+	TierFull    AuthorityTier = 1.0 // Verified meter readings, confirmed empty, exact user residual
+	TierPartial AuthorityTier = 0.5 // Bracketed user residual
+	TierZero    AuthorityTier = 0.0 // Estimated model, unknown
 )
 
 // ConfidenceLevel captures model certainty tiers.
