@@ -21,7 +21,7 @@ CREATE TABLE household_members (
 -- 3. household_profiles
 CREATE TABLE household_profiles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    household_id UUID NOT NULL REFERENCES households(id) ON DELETE CASCADE,
+    household_id UUID NOT NULL UNIQUE REFERENCES households(id) ON DELETE CASCADE,
     occupants INT NOT NULL CHECK (occupants > 0),
     feeder_band CHAR(1) NOT NULL CHECK (feeder_band IN ('A', 'B', 'C', 'D', 'E', 'U')),
     ac_count INT NOT NULL DEFAULT 0,
@@ -67,12 +67,21 @@ CREATE TABLE recharges (
     idempotency_key UUID UNIQUE NOT NULL,
     meter_id UUID NOT NULL REFERENCES meters(id) ON DELETE CASCADE,
     units_purchased_kwh NUMERIC(10, 2) NOT NULL CHECK (units_purchased_kwh > 0),
-    amount_paid NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+    amount_paid NUMERIC(10, 2) NOT NULL DEFAULT 0.00 CHECK (amount_paid >= 0.00),
     exhaustion_state VARCHAR(30) NOT NULL CHECK (exhaustion_state IN ('CONFIRMED_EMPTY', 'HAD_UNITS_EXACT', 'HAD_UNITS_BRACKET', 'UNKNOWN')),
     residual_bracket VARCHAR(20) CHECK (residual_bracket IS NULL OR residual_bracket IN ('0-5', '5-10', '10-20', '20-40', '40+')),
-    residual_units_kwh NUMERIC(10, 2) DEFAULT NULL,
+    residual_units_kwh NUMERIC(10, 2) DEFAULT NULL CHECK (residual_units_kwh IS NULL OR residual_units_kwh >= 0.00),
     is_void BOOLEAN NOT NULL DEFAULT FALSE,
-    recharged_at TIMESTAMPTZ NOT NULL
+    recharged_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT chk_recharge_residual_consistency CHECK (
+        (exhaustion_state = 'CONFIRMED_EMPTY' AND residual_bracket IS NULL AND (residual_units_kwh IS NULL OR residual_units_kwh = 0.00))
+        OR
+        (exhaustion_state = 'HAD_UNITS_EXACT' AND residual_bracket IS NULL AND residual_units_kwh IS NOT NULL AND residual_units_kwh >= 0.00)
+        OR
+        (exhaustion_state = 'HAD_UNITS_BRACKET' AND residual_bracket IS NOT NULL AND residual_bracket IN ('0-5', '5-10', '10-20', '20-40', '40+') AND residual_units_kwh IS NULL)
+        OR
+        (exhaustion_state = 'UNKNOWN' AND residual_bracket IS NULL AND residual_units_kwh IS NULL)
+    )
 );
 
 -- 7. cycle_audits
